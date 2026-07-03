@@ -182,4 +182,3 @@ git add .
 git commit -m "Describe change"
 git push -u origin feature/my-change
 ```
-g
