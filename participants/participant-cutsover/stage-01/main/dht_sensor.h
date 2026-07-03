@@ -1,0 +1,8 @@
+#pragma once
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+extern QueueHandle_t dht_queue;
+
+void dht_sensor_start(void);
