@@ -1,4 +1,4 @@
-# Stage 01 - ESP32 Challenge ааа
+# Stage 01 - ESP32 Challenge ABOBA
 
 ESP-IDF 5.5.4 project for `participant-cutsover`.
 
