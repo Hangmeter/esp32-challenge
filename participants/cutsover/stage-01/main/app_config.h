@@ -2,9 +2,9 @@
 
 #include "driver/gpio.h"
 
-#define LED_RED_GPIO GPIO_NUM_23
-#define LED_GREEN_GPIO GPIO_NUM_22
-#define LED_BLUE_GPIO GPIO_NUM_21
+#define LED_RED_GPIO GPIO_NUM_25
+#define LED_GREEN_GPIO GPIO_NUM_26
+#define LED_BLUE_GPIO GPIO_NUM_27
 
 #define DHT22_GPIO GPIO_NUM_4
 
