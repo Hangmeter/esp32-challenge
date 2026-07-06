@@ -26,3 +26,5 @@ mosquitto.db
 mosquitto.log
 mosquitto.err.log
 mosquitto.passwd
+mosquitto-lan.out
+mosquitto-lan.err
