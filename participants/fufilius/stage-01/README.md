@@ -1,180 +1,153 @@
-# ESP32-C3 Super Mini sensor hub
+# ESP32 MQTT sensor hub
 
-ESP-IDF firmware for an ESP32-C3 Super Mini board. The application reads
-temperature and humidity from a DHT22 sensor and displays the current controller
-state on an RGB LED.
-
-The firmware is organized around FreeRTOS tasks and queues:
-
-- DHT22 worker publishes temperature/humidity readings through a regular queue.
-- RGB worker blinks one LED channel according to the controller state.
-- The main controller task validates sensor data and drives the RGB state.
-- Wi-Fi manager starts a first-run setup access point and serves a small web UI.
-- The IP event handler converts ESP-IDF `IP_EVENT` notifications into a small
-  internal network-event queue.
+ESP-IDF project for an ESP32 development board. The firmware reads a BH1750
+light sensor and a DHT22 temperature/humidity sensor, publishes rounded sensor
+values to MQTT, and shows system status with RGB LEDs.
 
 ## Hardware
 
-- ESP32-C3 Super Mini
+- ESP32 development board
+- BH1750 / GY-302 I2C light sensor
 - DHT22 temperature and humidity sensor
 - RGB LED or three separate LEDs
+
+BH1750 wiring:
+
+```text
+BH1750 VCC  -> 3V3
+BH1750 GND  -> GND
+BH1750 SDA  -> GPIO21
+BH1750 SCL  -> GPIO22
+BH1750 ADDR -> GND or not connected
+```
 
 DHT22 wiring:
 
 ```text
 DHT22 VCC  -> 3V3
 DHT22 GND  -> GND
-DHT22 DATA -> GPIO10
+DHT22 DATA -> GPIO27
 ```
 
-If the DHT22 is not a ready-made module, add a pull-up resistor of about `10k`
-between DATA and `3V3`.
+If the DHT22 is not a ready-made module, add a `10k` pull-up resistor between
+DATA and `3V3`.
 
-RGB LED wiring used by the firmware:
+RGB LED wiring:
 
 ```text
-Red   -> GPIO0
-Green -> GPIO2
-Blue  -> GPIO1
+Red   -> GPIO25
+Green -> GPIO26
+Blue  -> GPIO33
 ```
 
-If the LED is common-anode or otherwise active-low, update this macro in
-`main/rgb_led.c`:
-
-```c
-#define LED_ACTIVE_LEVEL 0
-```
-
-## Pin Map
-
-| Function | GPIO |
-| --- | ---: |
-| DHT22 DATA | 10 |
-| RGB red | 0 |
-| RGB green | 2 |
-| RGB blue | 1 |
-
-## Wi-Fi Setup
-
-On first boot, or when no saved Wi-Fi credentials are available, the firmware
-starts a setup access point:
-
-```text
-SSID:     ESP32-Setup
-Password: configure123
-```
-
-Connect to this access point and open:
-
-```text
-http://192.168.4.1/
-```
-
-The setup page scans nearby Wi-Fi networks, lets you choose an SSID, and saves
-the password in NVS. On the next boot the firmware reuses the saved credentials.
-
-After the ESP32-C3 connects to your Wi-Fi network, the serial monitor prints the
-assigned IP address. Open that address in a browser to see the latest DHT22
-reading, or use:
-
-```text
-http://<device-ip>/api/sensors
-```
+BOOT / `GPIO0` is used to reset saved Wi-Fi and MQTT settings. Hold it for
+about 3 seconds.
 
 ## Behavior
 
-The DHT22 is sampled every 3 seconds. The main controller waits for the latest
-DHT22 reading, validates it, and converts the result into these RGB states:
+On first boot, or after settings reset, ESP32 starts a setup access point:
 
-| State | Meaning | LED indication |
-| --- | --- | --- |
-| `SYSTEM_STATE_OK` | Wi-Fi connected and DHT22 data is valid | green, 1 Hz |
-| `SYSTEM_STATE_WARNING` | setup AP is running or Wi-Fi is connecting | blue, 2 Hz |
-| `SYSTEM_STATE_CRITICAL` | DHT22 timeout/error or Wi-Fi unavailable | red, 4 Hz |
+```text
+SSID: ESP32-Setup
+Password: configure123
+Setup page: http://192.168.4.1/
+```
 
-Valid DHT22 readings are printed to the serial monitor. If the DHT22 read fails
-or no reading arrives before the controller timeout, the RGB indicator switches
-to the critical state. Values outside the DHT22 operating range (`-40..80 C`,
-`0..100 %`) are also rejected. The next valid reading returns the indicator to
-`OK`.
+The setup page stores these settings in NVS:
 
-The network module registers an asynchronous ESP-IDF `IP_EVENT` handler. It
-maps IP events to:
+- Wi-Fi SSID
+- Wi-Fi password
+- MQTT URI, for example `mqtt://172.16.101.38:1883`
+- MQTT topic, default `esp32/sensors`
+- MQTT username/password, if required
 
-- `NETWORK_EVENT_CONNECTING`
-- `NETWORK_EVENT_CONNECTED`
-- `NETWORK_EVENT_LOST`
+After settings are saved, later boots connect automatically.
 
-This project does not yet configure Wi-Fi or Ethernet by itself. The handler is
-ready for integration with a networking module that creates a station,
-Ethernet, or other network interface and emits ESP-IDF IP events.
+## MQTT
 
-## Main controller
+Sensor values are rounded to integers before logging and publishing. MQTT
+messages are published only when rounded values change.
 
-The main application logic runs in a dedicated FreeRTOS task. It switches
-between these states:
+Example payload:
 
-- `ST_INIT`: sends the initial critical RGB state while the system starts.
-- `ST_CONNECTING`: waits briefly for network/IP events before continuing the
-  sensor loop.
-- `ST_WAIT_SENSOR_DATA`: waits for the latest DHT22 reading and drains stale
-  queued DHT22 readings.
-- `ST_PROCESS_SENSOR_DATA`: validates DHT22 data and calculates the RGB state.
-- `ST_UPDATE_OUTPUT`: sends the calculated RGB state to the RGB overwrite queue.
-- `ST_RECOVERY`: enters network recovery mode after an IP loss event.
-- `ST_ERROR`: switches the RGB indicator to the critical state when sensor data
-  is invalid.
+```json
+{"light_lux":791,"temperature_c":24,"humidity_percent":41}
+```
 
-The DHT22 reading structure contains an `is_valid` flag. If the sensor reports
-invalid data, the controller logs the error and enters `ST_ERROR`. On the next
-loop the controller returns to waiting for fresh sensor data, so a temporary
-sensor failure can recover automatically when valid readings appear again.
+For the local Mosquitto broker used during development:
 
-When the network event handler receives an IP loss event, the controller moves
-to `ST_RECOVERY`, switches the RGB indicator to the critical state, waits for a
-short recovery delay, and then returns to `ST_CONNECTING`.
+```text
+Host: 172.16.101.38
+Port: 1883
+Username: esp32
+Password: esp32pass
+Topic: esp32/sensors
+```
+
+Local Mosquitto runtime files such as `mosquitto.passwd`, `mosquitto.log`, and
+`mosquitto.db` are ignored by Git.
+
+## LED status
+
+- Green: Wi-Fi connected, MQTT connected, and sensors are OK
+- Blue: setup access point is running
+- Red: Wi-Fi unavailable or sensor data is invalid
+
+## Sensors
+
+BH1750 is read over I2C once per second.
+
+DHT22 is read through the ESP32 RMT peripheral instead of manual GPIO polling.
+This keeps DHT22 readings stable while Wi-Fi and MQTT are active.
+
+The serial monitor prints compact sensor lines only when rounded values or
+sensor status change:
+
+```text
+sensors: BH1750=791 lx, DHT22=24 C 41 %
+```
 
 ## Build and flash
 
-Requirements:
-
-- ESP-IDF v5.5.4
-- ESP32-C3 target
-- 4 MB flash configuration
+Install ESP-IDF tools for the ESP32 target:
 
 ```powershell
-idf.py set-target esp32c3
+cd C:\esp\v5.5.4\esp-idf
+.\install.ps1 esp32
+```
+
+Build and flash:
+
+```powershell
+cd D:\IDE\esp32.v1-esp32
+C:\esp\v5.5.4\esp-idf\export.ps1
+idf.py set-target esp32
 idf.py build
 idf.py -p COMx flash monitor
 ```
 
-The checked-in `sdkconfig` is already set for `esp32c3`, a 4 MB flash chip, and
-the default single-app partition table.
+The project is configured for a 4 MB flash chip.
 
-## Development Environment
+## Development environment
 
 This project keeps VS Code ESP-IDF settings in Git. Install ESP-IDF v5.5.4 on
-each Windows PC to the same path:
+each Windows PC to:
 
 ```text
 C:\esp\v5.5.4\esp-idf
 ```
 
-When opening the project in VS Code, the default terminal profile runs
-`export.ps1` automatically. After opening a new terminal, `idf.py` should be
-ready to use without manually activating a Python virtual environment.
-
-The serial port can differ between PCs. If needed, update `COM4` in
+The serial port can differ between PCs. Update `COM5` in
 `.vscode/settings.json` or pass a port explicitly:
 
 ```powershell
 idf.py -p COMx flash monitor
 ```
 
-## Git Workflow
+## Git workflow
 
-The `main` branch is protected. Make changes in a feature branch, push it to
-GitHub, and merge through a pull request:
+The `main` branch is protected on GitHub. Make changes in a feature branch,
+push it, and merge through a pull request:
 
 ```powershell
 git switch -c feature/my-change

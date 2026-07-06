@@ -1,10 +1,10 @@
 {
   "idf.customExtraVars": {},
   "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
-  "idf.port": "COM4",
-  "idf.monitorPort": "COM4",
-  "idf.portWin": "COM4",
-  "idf.flashType": "JTAG",
+  "idf.port": "COM5",
+  "idf.monitorPort": "COM5",
+  "idf.portWin": "COM5",
+  "idf.flashType": "UART",
   "terminal.integrated.defaultProfile.windows": "ESP-IDF 5.5.4",
   "terminal.integrated.profiles.windows": {
     "ESP-IDF 5.5.4": {
