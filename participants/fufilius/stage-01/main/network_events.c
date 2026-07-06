@@ -49,10 +49,7 @@ static void queue_network_event(network_event_type_t type, int32_t event_id)
         .timestamp_us = esp_timer_get_time(),
     };
 
-    if (xQueueSend(s_event_queue, &event, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "network event queue is full; dropped %s",
-                 network_event_type_name(type));
-    }
+    xQueueOverwrite(s_event_queue, &event);
 }
 
 static void ip_event_handler(void *arg, esp_event_base_t event_base,

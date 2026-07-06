@@ -22,8 +22,8 @@
 
 #define LIGHT_POLL_INTERVAL_MS 1000
 #define SENSOR_WAIT_TIMEOUT_MS 1500
-#define DHT22_QUEUE_LENGTH 8
-#define NETWORK_EVENT_QUEUE_LENGTH 8
+#define DHT22_QUEUE_LENGTH 1
+#define NETWORK_EVENT_QUEUE_LENGTH 1
 #define NETWORK_CONNECT_WAIT_MS 500
 #define NETWORK_RECOVERY_DELAY_MS 2000
 #define DHT22_STARTUP_DELAY_MS 6000
@@ -126,7 +126,6 @@ static void bh1750_worker_task(void *arg)
 static void dht22_worker_task(void *arg)
 {
     QueueHandle_t reading_queue = (QueueHandle_t)arg;
-    bool queue_full_reported = false;
     bool has_last_valid = false;
     dht22_reading_t last_valid = {0};
     int consecutive_failures = 0;
@@ -158,14 +157,7 @@ static void dht22_worker_task(void *arg)
                      reading.temperature_c, reading.humidity_percent);
         }
 
-        if (xQueueSend(reading_queue, &reading, 0) != pdTRUE) {
-            if (!queue_full_reported) {
-                ESP_LOGW(TAG, "DHT22 queue is full; readings will be dropped");
-                queue_full_reported = true;
-            }
-        } else {
-            queue_full_reported = false;
-        }
+        xQueueOverwrite(reading_queue, &reading);
 
         vTaskDelay(pdMS_TO_TICKS(DHT22_SAMPLE_INTERVAL_MS));
     }
@@ -532,6 +524,19 @@ static void app_controller_task(void *arg)
     }
 }
 
+static bool create_task_checked(TaskFunction_t task_func, const char *name,
+                                uint32_t stack_depth, void *arg,
+                                UBaseType_t priority)
+{
+    const BaseType_t result =
+        xTaskCreate(task_func, name, stack_depth, arg, priority, NULL);
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "failed to create task '%s'", name);
+        return false;
+    }
+    return true;
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -578,9 +583,11 @@ void app_main(void)
 
     if (network_events_init(s_network_event_queue) != ESP_OK) {
         ESP_LOGE(TAG, "failed to initialize network events");
+        return;
     }
     if (mqtt_manager_init(s_network_event_queue) != ESP_OK) {
         ESP_LOGE(TAG, "failed to initialize MQTT manager");
+        return;
     }
 
     const bool bh1750_ready = bh1750_init() == ESP_OK;
@@ -588,13 +595,20 @@ void app_main(void)
         ESP_LOGE(TAG, "BH1750 initialization failed");
     }
 
-    xTaskCreate(rgb_blink_task, "rgb_blink", 2048, s_rgb_state_queue, 5, NULL);
-    xTaskCreate(app_controller_task, "app_controller", 4096, NULL, 6, NULL);
-    xTaskCreate(dht22_worker_task, "dht22_worker", 3072, s_dht22_queue, 4, NULL);
-    xTaskCreate(settings_reset_button_task, "settings_reset", 2048, NULL, 4, NULL);
+    if (!create_task_checked(rgb_blink_task, "rgb_blink", 2048,
+                             s_rgb_state_queue, 5) ||
+        !create_task_checked(app_controller_task, "app_controller", 4096,
+                             NULL, 6) ||
+        !create_task_checked(dht22_worker_task, "dht22_worker", 3072,
+                             s_dht22_queue, 4) ||
+        !create_task_checked(settings_reset_button_task, "settings_reset", 2048,
+                             NULL, 4)) {
+        return;
+    }
 
     if (bh1750_ready) {
         vTaskDelay(pdMS_TO_TICKS(BH1750_MEASUREMENT_DELAY_MS));
-        xTaskCreate(bh1750_worker_task, "bh1750_worker", 3072, s_light_queue, 4, NULL);
+        (void)create_task_checked(bh1750_worker_task, "bh1750_worker", 3072,
+                                  s_light_queue, 4);
     }
 }

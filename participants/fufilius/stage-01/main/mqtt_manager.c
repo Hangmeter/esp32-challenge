@@ -13,6 +13,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/semphr.h"
 #include "mqtt_client.h"
 #include "network_events.h"
 #include "nvs.h"
@@ -50,6 +51,10 @@ static QueueHandle_t s_network_event_queue;
 static httpd_handle_t s_http_server;
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
+static SemaphoreHandle_t s_client_mutex;
+static SemaphoreHandle_t s_settings_mutex;
+static SemaphoreHandle_t s_wifi_mutex;
+static portMUX_TYPE s_state_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static esp_mqtt_client_handle_t s_mqtt_client;
 static saved_settings_t s_settings;
 static int s_retry_count;
@@ -57,6 +62,117 @@ static bool s_setup_ap_running;
 static bool s_sta_connected;
 static bool s_manual_setup_requested;
 static bool s_mqtt_connected;
+static bool s_recovery_ap_task_pending;
+
+static void state_lock(void)
+{
+    taskENTER_CRITICAL(&s_state_spinlock);
+}
+
+static void state_unlock(void)
+{
+    taskEXIT_CRITICAL(&s_state_spinlock);
+}
+
+static void client_lock(void)
+{
+    if (s_client_mutex != NULL) {
+        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+    }
+}
+
+static void client_unlock(void)
+{
+    if (s_client_mutex != NULL) {
+        xSemaphoreGive(s_client_mutex);
+    }
+}
+
+static void wifi_lock(void)
+{
+    if (s_wifi_mutex != NULL) {
+        xSemaphoreTake(s_wifi_mutex, portMAX_DELAY);
+    }
+}
+
+static void wifi_unlock(void)
+{
+    if (s_wifi_mutex != NULL) {
+        xSemaphoreGive(s_wifi_mutex);
+    }
+}
+
+static bool settings_lock(void)
+{
+    return s_settings_mutex != NULL &&
+           xSemaphoreTake(s_settings_mutex, pdMS_TO_TICKS(100)) == pdTRUE;
+}
+
+static void settings_unlock(void)
+{
+    if (s_settings_mutex != NULL) {
+        xSemaphoreGive(s_settings_mutex);
+    }
+}
+
+static esp_err_t settings_get_copy(saved_settings_t *settings)
+{
+    if (settings == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!settings_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    *settings = s_settings;
+    settings_unlock();
+    return ESP_OK;
+}
+
+static esp_err_t settings_set_copy(const saved_settings_t *settings)
+{
+    if (settings == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!settings_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_settings = *settings;
+    settings_unlock();
+    return ESP_OK;
+}
+
+static esp_err_t settings_clear_cached(void)
+{
+    if (!settings_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    memset(&s_settings, 0, sizeof(s_settings));
+    settings_unlock();
+    return ESP_OK;
+}
+
+static bool settings_have_saved(void)
+{
+    bool has_settings = false;
+    if (settings_lock()) {
+        has_settings = s_settings.has_settings;
+        settings_unlock();
+    }
+    return has_settings;
+}
+
+static esp_err_t settings_get_topic(char *topic, size_t topic_size)
+{
+    if (topic == NULL || topic_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!settings_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    strlcpy(topic, s_settings.mqtt_topic, topic_size);
+    settings_unlock();
+    return ESP_OK;
+}
 
 static void queue_network_event(network_event_type_t type, int32_t event_id)
 {
@@ -70,9 +186,7 @@ static void queue_network_event(network_event_type_t type, int32_t event_id)
         .timestamp_us = esp_timer_get_time(),
     };
 
-    if (xQueueSend(s_network_event_queue, &event, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "network event queue is full; dropped event %d", type);
-    }
+    xQueueOverwrite(s_network_event_queue, &event);
 }
 
 static esp_err_t nvs_get_str_optional(nvs_handle_t nvs, const char *key,
@@ -258,14 +372,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
+        state_lock();
         s_mqtt_connected = true;
+        state_unlock();
         ESP_LOGI(TAG, "MQTT connected");
         break;
     case MQTT_EVENT_DISCONNECTED:
-        if (s_mqtt_connected) {
+        bool was_connected;
+
+        state_lock();
+        was_connected = s_mqtt_connected;
+        s_mqtt_connected = false;
+        state_unlock();
+        if (was_connected) {
             ESP_LOGW(TAG, "MQTT disconnected");
         }
-        s_mqtt_connected = false;
         break;
     default:
         break;
@@ -274,6 +395,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 static esp_err_t start_mqtt_client(void)
 {
+    saved_settings_t settings;
+
+    ESP_RETURN_ON_ERROR(settings_get_copy(&settings), TAG,
+                        "failed to read MQTT settings");
+
+    state_lock();
+    s_mqtt_connected = false;
+    state_unlock();
+
+    client_lock();
     if (s_mqtt_client != NULL) {
         esp_mqtt_client_stop(s_mqtt_client);
         esp_mqtt_client_destroy(s_mqtt_client);
@@ -281,50 +412,73 @@ static esp_err_t start_mqtt_client(void)
     }
 
     esp_mqtt_client_config_t config = {
-        .broker.address.uri = s_settings.mqtt_uri,
-        .credentials.username = s_settings.mqtt_username[0] != '\0'
-            ? s_settings.mqtt_username
+        .broker.address.uri = settings.mqtt_uri,
+        .credentials.username = settings.mqtt_username[0] != '\0'
+            ? settings.mqtt_username
             : NULL,
-        .credentials.authentication.password = s_settings.mqtt_password[0] != '\0'
-            ? s_settings.mqtt_password
+        .credentials.authentication.password = settings.mqtt_password[0] != '\0'
+            ? settings.mqtt_password
             : NULL,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&config);
     if (s_mqtt_client == NULL) {
+        client_unlock();
         return ESP_FAIL;
     }
 
-    ESP_RETURN_ON_ERROR(esp_mqtt_client_register_event(s_mqtt_client,
-                                                       ESP_EVENT_ANY_ID,
-                                                       mqtt_event_handler, NULL),
-                        TAG, "failed to register MQTT event handler");
-    ESP_RETURN_ON_ERROR(esp_mqtt_client_start(s_mqtt_client), TAG,
-                        "failed to start MQTT client");
+    esp_err_t err = esp_mqtt_client_register_event(s_mqtt_client,
+                                                   ESP_EVENT_ANY_ID,
+                                                   mqtt_event_handler, NULL);
+    if (err == ESP_OK) {
+        err = esp_mqtt_client_start(s_mqtt_client);
+    }
+    if (err != ESP_OK) {
+        esp_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+        client_unlock();
+        return err;
+    }
+    client_unlock();
+
     ESP_LOGI(TAG, "MQTT client starting: %s, topic '%s'",
-             s_settings.mqtt_uri, s_settings.mqtt_topic);
+             settings.mqtt_uri, settings.mqtt_topic);
     return ESP_OK;
 }
 
 static esp_err_t start_sta_connect(void)
 {
+    saved_settings_t settings;
+    ESP_RETURN_ON_ERROR(settings_get_copy(&settings), TAG,
+                        "failed to read Wi-Fi settings");
+
     wifi_config_t sta_config = {0};
-    strlcpy((char *)sta_config.sta.ssid, s_settings.wifi_ssid,
+    strlcpy((char *)sta_config.sta.ssid, settings.wifi_ssid,
             sizeof(sta_config.sta.ssid));
-    strlcpy((char *)sta_config.sta.password, s_settings.wifi_password,
+    strlcpy((char *)sta_config.sta.password, settings.wifi_password,
             sizeof(sta_config.sta.password));
     sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
     sta_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG,
-                        "failed to set STA mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_config), TAG,
-                        "failed to set STA config");
-
+    state_lock();
     s_manual_setup_requested = false;
     s_retry_count = 0;
+    s_recovery_ap_task_pending = false;
+    state_unlock();
+
+    wifi_lock();
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_connect();
+    }
+    wifi_unlock();
+    ESP_RETURN_ON_ERROR(err, TAG, "failed to start STA connection");
+
     queue_network_event(NETWORK_EVENT_CONNECTING, WIFI_EVENT_STA_START);
-    return esp_wifi_connect();
+    return ESP_OK;
 }
 
 static esp_err_t connect_post_handler(httpd_req_t *req)
@@ -371,8 +525,9 @@ static esp_err_t connect_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    s_settings = settings;
-    s_settings.has_settings = true;
+    settings.has_settings = true;
+    ESP_RETURN_ON_ERROR(settings_set_copy(&settings), TAG,
+                        "failed to cache saved settings");
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,
@@ -486,18 +641,41 @@ static esp_err_t start_setup_ap(void)
         },
     };
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG,
-                        "failed to set APSTA mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), TAG,
-                        "failed to set AP config");
-    ESP_RETURN_ON_ERROR(start_http_server(), TAG,
-                        "failed to start setup web server");
+    wifi_lock();
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    }
+    if (err == ESP_OK) {
+        err = start_http_server();
+    }
+    wifi_unlock();
+    ESP_RETURN_ON_ERROR(err, TAG, "failed to start setup AP");
 
+    state_lock();
     s_setup_ap_running = true;
+    s_recovery_ap_task_pending = false;
+    state_unlock();
     queue_network_event(NETWORK_EVENT_CONNECTING, WIFI_EVENT_AP_START);
     ESP_LOGI(TAG, "setup AP started: SSID '%s', password '%s'",
              SETUP_AP_SSID, SETUP_AP_PASSWORD);
     return ESP_OK;
+}
+
+static bool recovery_ap_still_needed(void)
+{
+    bool should_start;
+
+    state_lock();
+    should_start = s_recovery_ap_task_pending &&
+                   !s_sta_connected &&
+                   !s_setup_ap_running;
+    if (!should_start) {
+        s_recovery_ap_task_pending = false;
+    }
+    state_unlock();
+
+    return should_start;
 }
 
 static void delayed_setup_ap_task(void *arg)
@@ -505,8 +683,17 @@ static void delayed_setup_ap_task(void *arg)
     (void)arg;
 
     vTaskDelay(pdMS_TO_TICKS(RECOVERY_AP_DELAY_MS));
+    if (!recovery_ap_still_needed()) {
+        ESP_LOGI(TAG, "setup AP recovery skipped; STA recovered");
+        vTaskDelete(NULL);
+        return;
+    }
+
     if (start_setup_ap() != ESP_OK) {
         ESP_LOGE(TAG, "failed to start setup AP after Wi-Fi failure");
+        state_lock();
+        s_recovery_ap_task_pending = false;
+        state_unlock();
     }
     vTaskDelete(NULL);
 }
@@ -518,7 +705,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     (void)event_data;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (load_settings(&s_settings) == ESP_OK && s_settings.has_settings) {
+        saved_settings_t settings;
+        if (load_settings(&settings) == ESP_OK && settings.has_settings) {
+            if (settings_set_copy(&settings) != ESP_OK) {
+                ESP_LOGE(TAG, "failed to cache loaded settings");
+                start_setup_ap();
+                return;
+            }
             start_sta_connect();
         } else {
             start_setup_ap();
@@ -527,24 +720,51 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        int retry_count;
+        const bool has_settings = settings_have_saved();
+        bool should_retry = false;
+        bool should_schedule_ap = false;
+
+        state_lock();
         s_mqtt_connected = false;
         if (s_manual_setup_requested) {
             s_sta_connected = false;
             s_retry_count = 0;
+            state_unlock();
             return;
         }
 
         s_sta_connected = false;
+        if (s_retry_count < CONNECT_MAX_RETRIES && has_settings) {
+            s_retry_count++;
+            retry_count = s_retry_count;
+            should_retry = true;
+        } else if (!s_recovery_ap_task_pending && !s_setup_ap_running) {
+            s_recovery_ap_task_pending = true;
+            should_schedule_ap = true;
+            retry_count = s_retry_count;
+        } else {
+            retry_count = s_retry_count;
+        }
+        state_unlock();
+
         queue_network_event(NETWORK_EVENT_LOST, event_id);
 
-        if (s_retry_count < CONNECT_MAX_RETRIES && s_settings.has_settings) {
-            s_retry_count++;
-            ESP_LOGW(TAG, "Wi-Fi disconnected; retry %d/%d", s_retry_count,
+        if (should_retry) {
+            ESP_LOGW(TAG, "Wi-Fi disconnected; retry %d/%d", retry_count,
                      CONNECT_MAX_RETRIES);
+            wifi_lock();
             esp_wifi_connect();
-        } else {
+            wifi_unlock();
+        } else if (should_schedule_ap) {
             ESP_LOGW(TAG, "saved Wi-Fi is unavailable; starting setup AP");
-            xTaskCreate(delayed_setup_ap_task, "setup_ap_delay", 3072, NULL, 4, NULL);
+            if (xTaskCreate(delayed_setup_ap_task, "setup_ap_delay", 3072,
+                            NULL, 4, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "failed to create setup AP recovery task");
+                state_lock();
+                s_recovery_ap_task_pending = false;
+                state_unlock();
+            }
         }
     }
 }
@@ -558,14 +778,29 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "connected, IP address: " IPSTR, IP2STR(&event->ip_info.ip));
 
+        bool has_settings;
+        bool was_setup_ap_running;
+
+        has_settings = settings_have_saved();
+
+        state_lock();
         s_sta_connected = true;
         s_retry_count = 0;
+        s_recovery_ap_task_pending = false;
+        was_setup_ap_running = s_setup_ap_running;
         if (s_setup_ap_running) {
-            esp_wifi_set_mode(WIFI_MODE_STA);
             s_setup_ap_running = false;
         }
-        if (s_settings.has_settings && start_mqtt_client() != ESP_OK) {
+        state_unlock();
+
+        if (was_setup_ap_running) {
+            wifi_lock();
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            wifi_unlock();
+        }
+        if (has_settings && start_mqtt_client() != ESP_OK) {
             ESP_LOGE(TAG, "failed to start MQTT client");
+            return;
         }
     }
 }
@@ -577,6 +812,24 @@ esp_err_t mqtt_manager_init(QueueHandle_t network_event_queue)
     }
 
     s_network_event_queue = network_event_queue;
+    if (s_client_mutex == NULL) {
+        s_client_mutex = xSemaphoreCreateMutex();
+        if (s_client_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_settings_mutex == NULL) {
+        s_settings_mutex = xSemaphoreCreateMutex();
+        if (s_settings_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_wifi_mutex == NULL) {
+        s_wifi_mutex = xSemaphoreCreateMutex();
+        if (s_wifi_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -618,7 +871,21 @@ esp_err_t mqtt_manager_publish_sensor(const mqtt_sensor_payload_t *payload)
     if (payload == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_mqtt_client == NULL || !s_mqtt_connected) {
+    char topic[sizeof(s_settings.mqtt_topic)];
+    ESP_RETURN_ON_ERROR(settings_get_topic(topic, sizeof(topic)), TAG,
+                        "failed to read MQTT topic");
+
+    state_lock();
+    const bool is_connected = s_mqtt_connected;
+    state_unlock();
+
+    if (!is_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    client_lock();
+    if (s_mqtt_client == NULL) {
+        client_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -627,12 +894,13 @@ esp_err_t mqtt_manager_publish_sensor(const mqtt_sensor_payload_t *payload)
              "{\"light_lux\":%d,\"temperature_c\":%d,\"humidity_percent\":%d}",
              payload->light_lux, payload->temperature_c, payload->humidity_percent);
 
-    const int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_settings.mqtt_topic,
-                                               message, 0, 0, 0);
+    const int msg_id = esp_mqtt_client_enqueue(s_mqtt_client, topic,
+                                               message, 0, 0, 0, true);
+    client_unlock();
     if (msg_id < 0) {
         return ESP_FAIL;
     }
-    ESP_LOGD(TAG, "published sensor data to '%s'", s_settings.mqtt_topic);
+    ESP_LOGD(TAG, "published sensor data to '%s'", topic);
     return ESP_OK;
 }
 
@@ -646,22 +914,43 @@ esp_err_t mqtt_manager_reset_settings(void)
         return err;
     }
 
-    memset(&s_settings, 0, sizeof(s_settings));
+    client_lock();
+    if (s_mqtt_client != NULL) {
+        esp_mqtt_client_stop(s_mqtt_client);
+        esp_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+    }
+    client_unlock();
+
+    ESP_RETURN_ON_ERROR(settings_clear_cached(), TAG, "failed to clear settings cache");
+
+    state_lock();
     s_manual_setup_requested = true;
     s_sta_connected = false;
     s_mqtt_connected = false;
     s_retry_count = 0;
+    s_recovery_ap_task_pending = false;
+    state_unlock();
+
+    wifi_lock();
     esp_wifi_disconnect();
+    wifi_unlock();
 
     return start_setup_ap();
 }
 
 bool mqtt_manager_is_setup_ap_running(void)
 {
-    return s_setup_ap_running;
+    state_lock();
+    const bool is_running = s_setup_ap_running;
+    state_unlock();
+    return is_running;
 }
 
 bool mqtt_manager_is_mqtt_connected(void)
 {
-    return s_mqtt_connected;
+    state_lock();
+    const bool is_connected = s_mqtt_connected;
+    state_unlock();
+    return is_connected;
 }

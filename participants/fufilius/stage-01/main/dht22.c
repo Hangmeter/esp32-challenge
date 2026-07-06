@@ -10,11 +10,14 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #define DHT22_GPIO GPIO_NUM_27
 #define DHT22_RMT_RESOLUTION_HZ 1000000
 #define DHT22_RMT_SYMBOLS 64
 #define DHT22_RX_TIMEOUT_MS 30
+#define DHT22_READ_MUTEX_TIMEOUT_MS 100
 #define DHT22_START_SIGNAL_US 18000
 #define DHT22_START_RELEASE_US 40
 #define DHT22_ONE_THRESHOLD_US 50
@@ -22,6 +25,7 @@
 static const char *TAG = "dht22";
 static rmt_channel_handle_t s_rx_channel;
 static QueueHandle_t s_rx_queue;
+static SemaphoreHandle_t s_read_mutex;
 static rmt_symbol_word_t s_raw_symbols[DHT22_RMT_SYMBOLS];
 
 static bool dht22_rx_done_callback(rmt_channel_handle_t channel,
@@ -100,6 +104,14 @@ static esp_err_t parse_dht22_symbols(const rmt_symbol_word_t *symbols,
 
 void dht22_init(void)
 {
+    if (s_read_mutex == NULL) {
+        s_read_mutex = xSemaphoreCreateMutex();
+        if (s_read_mutex == NULL) {
+            ESP_LOGE(TAG, "failed to create read mutex");
+            return;
+        }
+    }
+
     gpio_reset_pin(DHT22_GPIO);
     gpio_set_direction(DHT22_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(DHT22_GPIO, GPIO_PULLUP_ONLY);
@@ -148,6 +160,13 @@ esp_err_t dht22_read(dht22_reading_t *reading)
     if (s_rx_channel == NULL || s_rx_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_read_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_read_mutex,
+                       pdMS_TO_TICKS(DHT22_READ_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     memset(reading, 0, sizeof(*reading));
     reading->error = ESP_OK;
@@ -165,7 +184,7 @@ esp_err_t dht22_read(dht22_reading_t *reading)
 
     gpio_set_direction(DHT22_GPIO, GPIO_MODE_OUTPUT_OD);
     gpio_set_level(DHT22_GPIO, 0);
-    esp_rom_delay_us(DHT22_START_SIGNAL_US);
+    vTaskDelay(pdMS_TO_TICKS(DHT22_START_SIGNAL_US / 1000));
     gpio_set_level(DHT22_GPIO, 1);
     gpio_set_direction(DHT22_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(DHT22_GPIO, GPIO_PULLUP_ONLY);
@@ -173,17 +192,20 @@ esp_err_t dht22_read(dht22_reading_t *reading)
     esp_err_t err = rmt_receive(s_rx_channel, s_raw_symbols, sizeof(s_raw_symbols),
                                 &receive_config);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_read_mutex);
         return err;
     }
 
     esp_rom_delay_us(DHT22_START_RELEASE_US);
 
     if (xQueueReceive(s_rx_queue, &rx_data, pdMS_TO_TICKS(DHT22_RX_TIMEOUT_MS)) != pdTRUE) {
+        xSemaphoreGive(s_read_mutex);
         return ESP_ERR_TIMEOUT;
     }
 
     err = parse_dht22_symbols(rx_data.received_symbols, rx_data.num_symbols, reading);
     reading->error = err;
     reading->is_valid = err == ESP_OK;
+    xSemaphoreGive(s_read_mutex);
     return err;
 }

@@ -113,7 +113,8 @@ a password hash. If the password is forgotten, create a new one with
 ## MQTT Payload
 
 Sensor values are rounded to integers before logging and publishing. MQTT
-messages are published only when rounded values or validity flags change.
+messages are published only when Wi-Fi/MQTT are connected, both sensors have
+valid readings, and rounded values change.
 
 Topic:
 
@@ -235,6 +236,8 @@ idf.py -p COMx flash monitor
 - BH1750 is read once per second.
 - DHT22 is sampled every 5 seconds after a startup delay.
 - DHT22 uses the RMT peripheral for stable timing while Wi-Fi and MQTT are active.
+- DHT22 and network queues keep the latest state/value instead of accumulating
+  stale history.
 - The serial monitor prints compact sensor summaries only when rounded values or
   sensor status change.
 - Press and hold BOOT / `GPIO0` for about 3 seconds to clear saved Wi-Fi/MQTT

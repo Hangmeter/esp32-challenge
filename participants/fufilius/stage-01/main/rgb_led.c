@@ -47,6 +47,11 @@ static const blink_profile_t BLINK_PROFILES[SYSTEM_STATE_COUNT] = {
     },
 };
 
+static bool is_valid_system_state(system_state_t state)
+{
+    return state >= SYSTEM_STATE_OK && state < SYSTEM_STATE_COUNT;
+}
+
 static void rgb_led_off(void)
 {
     gpio_set_level(LED_R_GPIO, LED_INACTIVE_LEVEL);
@@ -82,12 +87,17 @@ void rgb_blink_task(void *arg)
         led_is_on = !led_is_on;
         gpio_set_level(profile->gpio, led_is_on ? LED_ACTIVE_LEVEL : LED_INACTIVE_LEVEL);
 
-        if (xQueueReceive(state_queue, &next_state, half_period_ticks) == pdTRUE &&
+        const BaseType_t received =
+            xQueueReceive(state_queue, &next_state, half_period_ticks);
+
+        if (received == pdTRUE && is_valid_system_state(next_state) &&
             next_state != current_state) {
             rgb_led_off();
             led_is_on = false;
             current_state = next_state;
             ESP_LOGI(TAG, "blink profile: %s", BLINK_PROFILES[current_state].name);
+        } else if (received == pdTRUE && !is_valid_system_state(next_state)) {
+            ESP_LOGW(TAG, "ignored invalid blink state %d", (int)next_state);
         }
     }
 }
