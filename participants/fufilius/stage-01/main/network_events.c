@@ -49,10 +49,7 @@ static void queue_network_event(network_event_type_t type, int32_t event_id)
         .timestamp_us = esp_timer_get_time(),
     };
 
-    if (xQueueSend(s_event_queue, &event, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "network event queue is full; dropped %s",
-                 network_event_type_name(type));
-    }
+    xQueueOverwrite(s_event_queue, &event);
 }
 
 static void ip_event_handler(void *arg, esp_event_base_t event_base,
@@ -66,7 +63,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
     }
 
     const network_event_type_t type = network_event_type_from_ip_event(event_id);
-    ESP_LOGD(TAG, "IP event %ld -> %s", event_id, network_event_type_name(type));
+    ESP_LOGI(TAG, "IP event %ld -> %s", event_id, network_event_type_name(type));
     queue_network_event(type, event_id);
 }
 
@@ -98,7 +95,7 @@ esp_err_t network_events_init(QueueHandle_t event_queue)
     }
 
     queue_network_event(NETWORK_EVENT_CONNECTING, -1);
-    ESP_LOGD(TAG, "IP event handler registered");
+    ESP_LOGI(TAG, "IP event handler registered");
 
     return ESP_OK;
 }
